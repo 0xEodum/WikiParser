@@ -1,0 +1,285 @@
+import bz2
+import json
+from pathlib import Path
+
+from wikiparser.dump_converter import (
+    convert_catalog,
+    convert_dump,
+    extract_images,
+    extract_archive_links,
+    infer_wiki_base_url,
+    main,
+    parse_namespaces,
+    parse_page_element,
+    split_chapters,
+)
+
+
+SAMPLE_PAGE_XML = """<page>
+  <title>Example page</title>
+  <ns>0</ns>
+  <id>42</id>
+  <revision>
+    <id>1001</id>
+    <timestamp>2026-05-01T12:00:00Z</timestamp>
+    <contributor>
+      <username>ExampleUser</username>
+      <id>7</id>
+    </contributor>
+    <comment>small edit</comment>
+    <text xml:space="preserve">Lead paragraph with [[File:Lead image.jpg|thumb|Caption]].
+
+== History ==
+History text with [[Image:Map of place.svg|thumb]] and a [[regular link]].
+
+=== Details ===
+Nested details.
+
+== History ==
+Second history section.</text>
+  </revision>
+</page>"""
+
+
+def sample_dump_xml(*pages: str) -> str:
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
+  <siteinfo>
+    <sitename>Wikipedia</sitename>
+    <base>https://en.wikipedia.org/wiki/Main_Page</base>
+  </siteinfo>
+  {pages}
+</mediawiki>
+""".format(pages="\n".join(pages))
+
+
+def test_extract_images_builds_special_filepath_urls() -> None:
+    images = extract_images(
+        "[[File:Lead image.jpg|thumb]] [[Image:Map of place.svg|caption]]",
+        "https://en.wikipedia.org/wiki/",
+    )
+
+    assert images == [
+        "https://en.wikipedia.org/wiki/Special:FilePath/Lead_image.jpg",
+        "https://en.wikipedia.org/wiki/Special:FilePath/Map_of_place.svg",
+    ]
+
+
+def test_split_chapters_preserves_required_shape() -> None:
+    chapters = split_chapters(
+        "Lead paragraph.\n\n== History ==\nHistory text.\n=== Details ===\nMore.",
+        wiki_base_url="https://en.wikipedia.org/wiki/",
+        lead_title="Introduction",
+    )
+
+    assert list(chapters) == ["Introduction", "History", "Details"]
+    assert chapters["Introduction"] == {"text": "Lead paragraph.", "images": []}
+    assert chapters["History"]["text"] == "History text."
+
+
+def test_parse_page_element_extracts_target_fields() -> None:
+    import xml.etree.ElementTree as ET
+
+    element = ET.fromstring(SAMPLE_PAGE_XML)
+
+    page = parse_page_element(
+        element,
+        wiki_base_url="https://en.wikipedia.org/wiki/",
+        lead_title="Introduction",
+    )
+
+    assert page["title"] == "Example page"
+    assert page["page_id"] == 42
+    assert page["namespace"] == 0
+    assert page["revision_id"] == 1001
+    assert page["timestamp"] == "2026-05-01T12:00:00Z"
+    assert page["comment"] == "small edit"
+    assert page["contributor"] == "ExampleUser"
+    assert set(page["chapters"]) == {"Introduction", "History", "Details", "History (2)"}
+    assert page["chapters"]["Introduction"]["images"] == [
+        "https://en.wikipedia.org/wiki/Special:FilePath/Lead_image.jpg"
+    ]
+
+
+def test_convert_dump_writes_chunked_json_arrays(tmp_path: Path) -> None:
+    source = tmp_path / "sample.xml.bz2"
+    source.write_bytes(bz2.compress(sample_dump_xml(SAMPLE_PAGE_XML, SAMPLE_PAGE_XML).encode("utf-8")))
+    output_dir = tmp_path / "out"
+
+    summary = convert_dump(
+        source=str(source),
+        output_dir=output_dir,
+        pages_per_file=1,
+        wiki_base_url="https://en.wikipedia.org/wiki/",
+        lead_title="Introduction",
+    )
+
+    assert summary.pages_written == 2
+    assert summary.files_written == 2
+    first_file = output_dir / "pages-00001.json"
+    second_file = output_dir / "pages-00002.json"
+    assert first_file.exists()
+    assert second_file.exists()
+    assert json.loads(first_file.read_text(encoding="utf-8"))[0]["page_id"] == 42
+
+
+def test_extract_archive_links_filters_wikimedia_index() -> None:
+    html = """<html><body><pre>
+    <a href="../">../</a>
+    <a href="SHA256SUMS">SHA256SUMS</a>
+    <a href="_SUCCESS">_SUCCESS</a>
+    <a href="enwiki-2026-05-01-p10p1134785.xml.bz2">first</a>
+    <a href="https://dumps.wikimedia.org/other/mediawiki_content_current/enwiki/file.xml.bz2">absolute</a>
+    <a href="enwiki-2026-05-01-pages-meta-history.xml.bz2">history</a>
+    </pre></body></html>"""
+
+    links = extract_archive_links(
+        "https://dumps.wikimedia.org/other/mediawiki_content_current/enwiki/2026-05-01/xml/bzip2/",
+        html,
+    )
+
+    assert links == [
+        "https://dumps.wikimedia.org/other/mediawiki_content_current/enwiki/2026-05-01/xml/bzip2/enwiki-2026-05-01-p10p1134785.xml.bz2",
+        "https://dumps.wikimedia.org/other/mediawiki_content_current/enwiki/file.xml.bz2",
+        "https://dumps.wikimedia.org/other/mediawiki_content_current/enwiki/2026-05-01/xml/bzip2/enwiki-2026-05-01-pages-meta-history.xml.bz2",
+    ]
+
+
+def test_convert_catalog_writes_each_archive_to_own_directory(tmp_path: Path, monkeypatch) -> None:
+    first_source = tmp_path / "enwiki-2026-05-01-p1p2.xml.bz2"
+    second_source = tmp_path / "enwiki-2026-05-01-p3p4.xml.bz2"
+    first_source.write_bytes(bz2.compress(sample_dump_xml(SAMPLE_PAGE_XML, SAMPLE_PAGE_XML).encode("utf-8")))
+    second_source.write_bytes(bz2.compress(sample_dump_xml(SAMPLE_PAGE_XML, SAMPLE_PAGE_XML).encode("utf-8")))
+    output_dir = tmp_path / "catalog-out"
+
+    monkeypatch.setattr(
+        "wikiparser.dump_converter.list_catalog_archives",
+        lambda _catalog_url: [str(first_source), str(second_source)],
+    )
+
+    summary = convert_catalog(
+        catalog_url="https://dumps.wikimedia.org/other/mediawiki_content_current/enwiki/2026-05-01/xml/bzip2/",
+        output_dir=output_dir,
+        pages_per_file=1,
+        wiki_base_url="https://en.wikipedia.org/wiki/",
+        lead_title="Introduction",
+        namespaces={0},
+        limit=3,
+    )
+
+    first_output = output_dir / "enwiki-2026-05-01-p1p2" / "pages-00001.json"
+    second_output = output_dir / "enwiki-2026-05-01-p3p4" / "pages-00001.json"
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert summary.archives_processed == 2
+    assert summary.pages_written == 3
+    assert first_output.exists()
+    assert second_output.exists()
+    assert len(json.loads(first_output.read_text(encoding="utf-8"))) == 1
+    assert manifest["pages_written"] == 3
+    assert [item["pages_written"] for item in manifest["archives"]] == [2, 1]
+
+
+def test_convert_dump_filters_redirects_and_namespaces(tmp_path: Path) -> None:
+    redirect_page = SAMPLE_PAGE_XML.replace("<title>Example page</title>", "<title>Redirected</title>").replace(
+        "<revision>",
+        '<redirect title="Target" />\n  <revision>',
+        1,
+    )
+    talk_page = SAMPLE_PAGE_XML.replace("<title>Example page</title>", "<title>Talk page</title>").replace(
+        "<ns>0</ns>",
+        "<ns>1</ns>",
+        1,
+    )
+    source = tmp_path / "sample.xml"
+    source.write_text(sample_dump_xml(SAMPLE_PAGE_XML, redirect_page, talk_page), encoding="utf-8")
+    output_dir = tmp_path / "filtered"
+
+    summary = convert_dump(
+        source=str(source),
+        output_dir=output_dir,
+        pages_per_file=10,
+        wiki_base_url="https://en.wikipedia.org/wiki/",
+        lead_title="Introduction",
+        namespaces={0},
+    )
+
+    output = json.loads((output_dir / "pages-00001.json").read_text(encoding="utf-8"))
+    assert summary.pages_written == 1
+    assert output[0]["title"] == "Example page"
+
+
+def test_parse_page_element_uses_ip_and_handles_empty_text() -> None:
+    import xml.etree.ElementTree as ET
+
+    page_xml = """<page>
+      <title>IP page</title>
+      <ns>0</ns>
+      <id>5</id>
+      <revision>
+        <id>6</id>
+        <timestamp>2026-05-01T00:00:00Z</timestamp>
+        <contributor><ip>192.0.2.1</ip></contributor>
+      </revision>
+    </page>"""
+
+    page = parse_page_element(
+        ET.fromstring(page_xml),
+        wiki_base_url="https://en.wikipedia.org/wiki/",
+        lead_title="Introduction",
+    )
+
+    assert page["contributor"] == "192.0.2.1"
+    assert page["chapters"] == {"Empty": {"text": "", "images": []}}
+
+
+def test_helpers_validate_inputs_and_infer_wiki_urls(tmp_path: Path) -> None:
+    assert infer_wiki_base_url("https://dumps.wikimedia.org/enwiki/2026/file.xml.bz2") == (
+        "https://en.wikipedia.org/wiki/"
+    )
+    assert infer_wiki_base_url(
+        "https://dumps.wikimedia.org/other/mediawiki_content_current/ruwiki/2026-06-01/xml/bzip2/"
+    ) == "https://ru.wikipedia.org/wiki/"
+    assert parse_namespaces("0, 10") == {0, 10}
+    assert parse_namespaces("all") is None
+
+    try:
+        convert_dump(source=str(tmp_path / "missing.xml"), output_dir=tmp_path / "out")
+    except FileNotFoundError as exc:
+        assert "missing.xml" in str(exc)
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+    try:
+        convert_dump(source=str(tmp_path / "missing.xml"), output_dir=tmp_path / "out", pages_per_file=0)
+    except ValueError as exc:
+        assert "pages_per_file" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_cli_returns_success_and_error_codes(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "sample.xml.bz2"
+    source.write_bytes(bz2.compress(sample_dump_xml(SAMPLE_PAGE_XML).encode("utf-8")))
+    output_dir = tmp_path / "cli-out"
+
+    success_code = main(
+        [
+            str(source),
+            "--output-dir",
+            str(output_dir),
+            "--pages-per-file",
+            "1",
+            "--limit",
+            "1",
+        ]
+    )
+    success_err = capsys.readouterr().err
+
+    error_code = main([str(tmp_path / "missing.xml"), "--output-dir", str(tmp_path / "bad")])
+    error_err = capsys.readouterr().err
+
+    assert success_code == 0
+    assert "Wrote 1 pages" in success_err
+    assert error_code == 1
+    assert "error:" in error_err
