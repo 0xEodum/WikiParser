@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wiki-dump-converter"
+version = "0.2.0"
+description = "Convert Wikimedia XML/BZ2 dumps to chunked JSON or S3-like ontology layouts."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mwparserfromhell>=0.7.2",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3>=1.34"]
+test = ["pytest>=9.0", "pytest-cov>=7.0"]
+
+[project.scripts]
+wiki-dump-converter = "wikiparser.dump_converter:main"
+
+[tool.setuptools.packages.find]
+include = ["wikiparser*"]
+

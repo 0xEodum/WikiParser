@@ -17,10 +17,34 @@ from urllib.parse import quote, urljoin, urlparse
 import mwparserfromhell
 import requests
 
+from .ontology_writer import write_page_to_ontology_layout
+from .s3_io import load_s3_config, upload_directory_to_s3
+
 
 IMAGE_ALIASES = ("file", "image", "файл", "изображение")
 IMAGE_LINK_RE = re.compile(
     r"\[\[\s*(?P<prefix>File|Image|Файл|Изображение)\s*:\s*(?P<name>[^\]|#<>{}\n]+)",
+    re.IGNORECASE,
+)
+MEDIA_LINK_RE = re.compile(r"\[\[\s*(?:File|Image|Файл|Изображение)\s*:[^\]]+\]\]", re.IGNORECASE)
+TALK_PAREN_RE = re.compile(r"\s*\((?:talk|user talk|обсуждение|обс\.)\)", re.IGNORECASE)
+YEAR_RE = re.compile(r"\b(18[89]\d|19\d{2}|20\d{2})\b")
+MOVIE_HINT_RE = re.compile(r"\b(film|movie|фильм|мультфильм|телефильм)\b|infobox\s+film", re.IGNORECASE)
+IMAGE_ALIASES = ("file", "image", "\u0444\u0430\u0439\u043b", "\u0438\u0437\u043e\u0431\u0440\u0430\u0436\u0435\u043d\u0438\u0435")
+IMAGE_LINK_RE = re.compile(
+    r"\[\[\s*(?P<prefix>File|Image|\u0424\u0430\u0439\u043b|\u0418\u0437\u043e\u0431\u0440\u0430\u0436\u0435\u043d\u0438\u0435)\s*:\s*(?P<name>[^\]|#<>{}\n]+)",
+    re.IGNORECASE,
+)
+MEDIA_LINK_RE = re.compile(
+    r"\[\[\s*(?:File|Image|\u0424\u0430\u0439\u043b|\u0418\u0437\u043e\u0431\u0440\u0430\u0436\u0435\u043d\u0438\u0435)\s*:[^\]]+\]\]",
+    re.IGNORECASE,
+)
+TALK_PAREN_RE = re.compile(
+    r"\s*\((?:talk|user talk|\u043e\u0431\u0441\u0443\u0436\u0434\u0435\u043d\u0438\u0435|\u043e\u0431\u0441\.)\)",
+    re.IGNORECASE,
+)
+MOVIE_HINT_RE = re.compile(
+    r"\b(film|movie|\u0444\u0438\u043b\u044c\u043c|\u043c\u0443\u043b\u044c\u0442\u0444\u0438\u043b\u044c\u043c|\u0442\u0435\u043b\u0435\u0444\u0438\u043b\u044c\u043c)\b|infobox\s+film",
     re.IGNORECASE,
 )
 HEADING_RE = re.compile(r"^(?P<marks>={2,6})\s*(?P<title>.*?)\s*(?P=marks)\s*$", re.MULTILINE)
@@ -209,18 +233,18 @@ def extract_images(wikitext: str, wiki_base_url: str) -> list[str]:
     return images
 
 
-def strip_wikitext(wikitext: str) -> str:
-    if not wikitext.strip():
-        return ""
+def remove_media_links(wikitext: str) -> str:
+    return MEDIA_LINK_RE.sub("", wikitext)
 
-    parsed = mwparserfromhell.parse(wikitext)
-    text = parsed.strip_code(normalize=True, collapse=True)
+
+def normalize_whitespace(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.strip() for line in text.split("\n")]
 
     cleaned_lines: list[str] = []
     previous_blank = False
     for line in lines:
+        line = re.sub(r"[ \t]+", " ", line).strip()
         if not line:
             if not previous_blank and cleaned_lines:
                 cleaned_lines.append("")
@@ -230,6 +254,37 @@ def strip_wikitext(wikitext: str) -> str:
         previous_blank = False
 
     return "\n".join(cleaned_lines).strip()
+
+
+def clean_wiki_text(wikitext: str, *, remove_media: bool = True) -> str:
+    if not wikitext.strip():
+        return ""
+
+    source = remove_media_links(wikitext) if remove_media else wikitext
+    parsed = mwparserfromhell.parse(source)
+    text = parsed.strip_code(normalize=True, collapse=True)
+    text = TALK_PAREN_RE.sub("", text)
+    return normalize_whitespace(text)
+
+
+def strip_wikitext(wikitext: str) -> str:
+    return clean_wiki_text(wikitext, remove_media=True)
+
+
+def extract_year_candidates(title: str, wikitext: str) -> list[int]:
+    source = "\n".join([title or "", "\n".join(wikitext.splitlines()[:120])])
+    if not MOVIE_HINT_RE.search(source):
+        return []
+
+    years: list[int] = []
+    seen: set[int] = set()
+    for match in YEAR_RE.finditer(source):
+        year = int(match.group(1))
+        if year in seen:
+            continue
+        seen.add(year)
+        years.append(year)
+    return years
 
 
 def unique_title(title: str, chapters: OrderedDict[str, dict[str, object]]) -> str:
@@ -303,15 +358,19 @@ def parse_page_element(
     revision = revisions[-1] if revisions else None
     text_element = first_child(revision, "text") if revision is not None else None
     wikitext = text_element.text if text_element is not None and text_element.text is not None else ""
+    title = clean_wiki_text(child_text(page, "title"), remove_media=False)
+    year_candidates = extract_year_candidates(title, wikitext)
 
     return {
-        "title": child_text(page, "title"),
+        "title": title,
         "page_id": child_int(page, "id"),
         "namespace": child_int(page, "ns"),
         "revision_id": child_int(revision, "id") if revision is not None else 0,
         "timestamp": child_text(revision, "timestamp") if revision is not None else "",
-        "comment": child_text(revision, "comment") if revision is not None else "",
+        "comment": clean_wiki_text(child_text(revision, "comment"), remove_media=False) if revision is not None else "",
         "contributor": contributor_name(revision),
+        "publication_year": year_candidates[0] if year_candidates else None,
+        "year_candidates": year_candidates,
         "chapters": split_chapters(wikitext, wiki_base_url=wiki_base_url, lead_title=lead_title),
     }
 
@@ -379,6 +438,7 @@ def convert_dump(
     namespaces: set[int] | None = None,
     skip_redirects: bool = True,
     limit: int | None = None,
+    output_format: str = "json",
 ) -> ConversionSummary:
     if pages_per_file < 1:
         raise ValueError("pages_per_file must be >= 1")
@@ -402,15 +462,20 @@ def convert_dump(
             skip_redirects=skip_redirects,
             limit=limit,
         ):
-            chunk.append(page)
             pages_written += 1
 
+            if output_format == "ontology":
+                write_page_to_ontology_layout(page, output_path)
+                files_written += 1
+                continue
+
+            chunk.append(page)
             if len(chunk) >= pages_per_file:
                 files_written += 1
                 flush_chunk(output_path, files_written, chunk)
                 chunk = []
 
-    if chunk:
+    if output_format != "ontology" and chunk:
         files_written += 1
         flush_chunk(output_path, files_written, chunk)
 
@@ -456,6 +521,7 @@ def convert_catalog(
     skip_redirects: bool = True,
     limit: int | None = None,
     archive_limit: int | None = None,
+    output_format: str = "json",
 ) -> CatalogConversionSummary:
     if archive_limit is not None and archive_limit < 1:
         raise ValueError("archive_limit must be >= 1 when provided")
@@ -481,7 +547,7 @@ def convert_catalog(
         if remaining_limit is not None and remaining_limit < 1:
             break
 
-        archive_output_dir = output_path / archive_output_name(archive_source)
+        archive_output_dir = output_path if output_format == "ontology" else output_path / archive_output_name(archive_source)
         summary = convert_dump(
             source=archive_source,
             output_dir=archive_output_dir,
@@ -491,6 +557,7 @@ def convert_catalog(
             namespaces=namespaces,
             skip_redirects=skip_redirects,
             limit=remaining_limit,
+            output_format=output_format,
         )
         archive_summaries.append(
             ArchiveConversionSummary(
@@ -533,6 +600,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None, help="Stop after N emitted pages; useful for smoke tests")
     parser.add_argument("--catalog", action="store_true", help="Treat source as a Wikimedia directory listing")
     parser.add_argument("--archive-limit", type=int, default=None, help="Process at most N archives from a catalog")
+    parser.add_argument(
+        "--output-format",
+        choices=("json", "ontology"),
+        default="json",
+        help="json writes pages-*.json chunks; ontology writes S3-like core/* metadata layout",
+    )
+    parser.add_argument(
+        "--storage",
+        choices=("local", "s3", "both"),
+        default="local",
+        help="local keeps files on disk; s3/both upload the output directory after conversion",
+    )
+    parser.add_argument("--s3-bucket", default=None, help="Target S3 bucket for --storage s3/both")
+    parser.add_argument("--s3-prefix", default="", help="Prefix inside the S3 bucket")
+    parser.add_argument("--s3-endpoint-url", default=None, help="Custom S3 endpoint URL")
+    parser.add_argument("--s3-region", default=None, help="S3 region name")
+    parser.add_argument("--s3-cred-json", default=None, help="Credential JSON with bucket_name/url/reg/access_key/secret_key")
     return parser
 
 
@@ -552,7 +636,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 skip_redirects=not args.include_redirects,
                 limit=args.limit,
                 archive_limit=args.archive_limit,
+                output_format=args.output_format,
             )
+            if args.storage in {"s3", "both"}:
+                s3_summary = upload_directory_to_s3(
+                    catalog_summary.output_dir,
+                    load_s3_config(
+                        bucket=args.s3_bucket,
+                        prefix=args.s3_prefix,
+                        endpoint_url=args.s3_endpoint_url,
+                        region_name=args.s3_region,
+                        cred_json=args.s3_cred_json,
+                    ),
+                )
+                print(
+                    f"Uploaded {s3_summary.files_uploaded} file(s) to s3://{s3_summary.bucket}/{s3_summary.prefix}",
+                    file=sys.stderr,
+                )
             print(
                 (
                     f"Wrote {catalog_summary.pages_written} pages from "
@@ -572,7 +672,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             namespaces=parse_namespaces(args.namespaces),
             skip_redirects=not args.include_redirects,
             limit=args.limit,
+            output_format=args.output_format,
         )
+        if args.storage in {"s3", "both"}:
+            s3_summary = upload_directory_to_s3(
+                summary.output_dir,
+                load_s3_config(
+                    bucket=args.s3_bucket,
+                    prefix=args.s3_prefix,
+                    endpoint_url=args.s3_endpoint_url,
+                    region_name=args.s3_region,
+                    cred_json=args.s3_cred_json,
+                ),
+            )
+            print(
+                f"Uploaded {s3_summary.files_uploaded} file(s) to s3://{s3_summary.bucket}/{s3_summary.prefix}",
+                file=sys.stderr,
+            )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
