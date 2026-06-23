@@ -85,6 +85,33 @@ def candidate_years(movie_path: Path, metadata: dict) -> tuple[int, ...]:
     return tuple(sorted(years))
 
 
+def normalize_title(text: str) -> str:
+    text = re.sub(
+        r"\([^)]*\b(?:film|movie|\u0444\u0438\u043b\u044c\u043c|\u043c\u0443\u043b\u044c\u0442\u0444\u0438\u043b\u044c\u043c|\u0442\u0435\u043b\u0435\u0444\u0438\u043b\u044c\u043c)\b[^)]*\)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\([^)]*\b(?:18[89]\d|19\d{2}|20\d{2})\b[^)]*\)", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip().casefold()
+
+
+def candidate_years(movie_path: Path, metadata: dict) -> tuple[int, ...]:
+    years: set[int] = set(extract_years(json.dumps(metadata, ensure_ascii=False)))
+    info_dir = movie_path / "raw_data" / "sources" / "info"
+    if info_dir.exists():
+        for html_path in info_dir.glob("*.html"):
+            name = html_path.name.casefold()
+            if "\u043f\u0440\u0435\u043c" not in name and "year" not in name:
+                continue
+            try:
+                years.update(extract_years(html_path.read_text(encoding="utf-8", errors="ignore")))
+            except OSError:
+                continue
+    return tuple(sorted(years))
+
+
 def iter_movie_candidates(root: Path) -> Iterable[MovieCandidate]:
     movies_root = root / "core" / "movies" / "__unsorted__"
     if not movies_root.exists():
