@@ -5,13 +5,13 @@ Convert Wikimedia XML/BZ2 dumps into chunked JSON files or an S3-like ontology l
 Install from GitHub in Colab:
 
 ```python
-%pip install "git+https://github.com/<OWNER>/<REPO>.git"
+%pip install "git+https://github.com/0xEodum/WikiParser.git"
 ```
 
 With S3 upload support:
 
 ```python
-%pip install "wiki-dump-converter[s3] @ git+https://github.com/<OWNER>/<REPO>.git"
+%pip install "wiki-dump-converter[s3] @ git+https://github.com/0xEodum/WikiParser.git"
 ```
 
 Single dump:
