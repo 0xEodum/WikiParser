@@ -17,7 +17,7 @@ from urllib.parse import quote, urljoin, urlparse
 import mwparserfromhell
 import requests
 
-from .ontology_writer import write_page_to_ontology_layout
+from .ontology_writer import finalize_wiki_system, language_code_for, write_page_to_ontology_layout
 from .s3_io import load_s3_config, upload_directory_to_s3
 
 
@@ -448,6 +448,7 @@ def convert_dump(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     base_url = wiki_base_url or infer_wiki_base_url(source)
+    language_code = language_code_for(base_url)
 
     chunk: list[dict[str, object]] = []
     pages_written = 0
@@ -465,7 +466,7 @@ def convert_dump(
             pages_written += 1
 
             if output_format == "ontology":
-                write_page_to_ontology_layout(page, output_path)
+                write_page_to_ontology_layout(page, output_path, language_code=language_code)
                 files_written += 1
                 continue
 
@@ -478,6 +479,9 @@ def convert_dump(
     if output_format != "ontology" and chunk:
         files_written += 1
         flush_chunk(output_path, files_written, chunk)
+
+    if output_format == "ontology":
+        finalize_wiki_system(output_path)
 
     return ConversionSummary(
         pages_seen=pages_written,

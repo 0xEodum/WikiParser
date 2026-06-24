@@ -4,7 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
-from wikiparser.ontology_writer import write_page_to_ontology_layout
+from wikiparser.ontology_writer import finalize_wiki_system, write_page_to_ontology_layout
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -84,10 +84,9 @@ def create_wikipedia_pages(root: Path) -> None:
         },
     }
 
-    write_page_to_ontology_layout(matched_page, root)
-    write_page_to_ontology_layout(unmatched_page, root)
-    write_json(root / "core" / "wiki_pages" / "__system__" / "metadata.json", {"version": "v0.0.1"})
-    write_json(root / "core" / "wiki_pages" / "__system__" / "raw_data" / "metadata.json", {"count_raw_entities": 1})
+    write_page_to_ontology_layout(matched_page, root, language_code=2)
+    write_page_to_ontology_layout(unmatched_page, root, language_code=2)
+    finalize_wiki_system(root)
 
 
 def main() -> int:

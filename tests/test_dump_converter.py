@@ -14,7 +14,11 @@ from wikiparser.dump_converter import (
     parse_page_element,
     split_chapters,
 )
-from wikiparser.ontology_writer import write_page_to_ontology_layout
+from wikiparser.ontology_writer import (
+    finalize_wiki_system,
+    language_code_for,
+    write_page_to_ontology_layout,
+)
 from wikiparser.s3_io import load_s3_config, normalize_endpoint, s3_key
 
 
@@ -351,15 +355,84 @@ def test_write_page_to_ontology_layout_matches_movie_by_title_and_year(tmp_path:
 
     result = write_page_to_ontology_layout(page, tmp_path)
 
-    target_file = movie_root / "raw_data" / "sources" / "wikipedia" / "Example_page_2012_film_wikipedia.json"
-    source_meta = movie_root / "raw_data" / "sources" / "wikipedia" / "metadata.json"
-    payload = json.loads(target_file.read_text(encoding="utf-8"))
+    wikipedia_dir = movie_root / "raw_data" / "sources" / "wikipedia"
+    target_file = wikipedia_dir / "Example_page_2012_film_Introduction.html"
+    source_meta = wikipedia_dir / "metadata.json"
+    html = target_file.read_text(encoding="utf-8")
     metadata = json.loads(source_meta.read_text(encoding="utf-8"))
 
     assert result.matched
     assert result.movie_folder == "Example page"
-    assert payload["ontology_match"]["match_status"] == "matched"
-    assert metadata["order"] == ["Example_page_2012_film_wikipedia.json"]
+    assert html.startswith("<!DOCTYPE html>")
+    assert "<h1>Example page (2012 film)</h1>" in html
+    assert "<p>\n            Clean text\n        </p>" in html
+    assert metadata["is_composite"] is False
+    assert metadata["order"] == ["Example_page_2012_film_Introduction.html"]
+    # Matched-фильм принадлежит кластеру movies: existing_entity для него не пишется.
+    assert not (tmp_path / "core" / "wiki_pages" / "__system__" / "raw_data" / "existing_entities").exists()
+
+
+def test_language_code_for_resolves_wiki_url() -> None:
+    assert language_code_for("https://en.wikipedia.org/wiki/") == 2
+    assert language_code_for("https://ru.wikipedia.org/wiki/") == 1
+    assert language_code_for("https://example.com/") == 0
+    assert language_code_for(None) == 0
+
+
+def test_unmatched_page_writes_existing_entity_and_system(tmp_path: Path) -> None:
+    page = {
+        "title": "Mebbin National Park",
+        "page_id": 101064,
+        "namespace": 0,
+        "revision_id": 1341482661,
+        "timestamp": "2026-03-03T12:31:49Z",
+        "comment": "",
+        "contributor": "Entranced98",
+        "publication_year": None,
+        "year_candidates": [],
+        "chapters": {
+            "Introduction": {"text": "Lead paragraph.", "images": []},
+            "History": {"text": "Founded later.", "images": []},
+        },
+    }
+
+    result = write_page_to_ontology_layout(page, tmp_path, language_code=2)
+    count = finalize_wiki_system(tmp_path)
+
+    system_root = tmp_path / "core" / "wiki_pages" / "__system__"
+    entity_file = system_root / "raw_data" / "existing_entities" / "Mebbin National Park.json"
+    entity = json.loads(entity_file.read_text(encoding="utf-8"))
+    system_meta = json.loads((system_root / "raw_data" / "metadata.json").read_text(encoding="utf-8"))
+    wikipedia_meta = json.loads(
+        (
+            tmp_path / "core" / "wiki_pages" / "__unsorted__" / "Mebbin National Park"
+            / "raw_data" / "sources" / "wikipedia" / "metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert not result.matched
+    assert entity == [
+        {
+            "entity_name": "Mebbin National Park",
+            "parent_name": None,
+            "grandparent_name": None,
+            "representations": [
+                {
+                    "text": "Mebbin National Park",
+                    "representation_type": "1",
+                    "representation_language": 2,
+                    "representation_weight": 1,
+                }
+            ],
+        }
+    ]
+    assert count == 1
+    assert system_meta == {"count_raw_entities": 1}
+    # Порядок глав сохраняется в order.
+    assert wikipedia_meta["order"] == [
+        "Mebbin_National_Park_Introduction.html",
+        "Mebbin_National_Park_History.html",
+    ]
 
 
 def test_s3_config_supports_parse_mongo_credential_shape(tmp_path: Path) -> None:
