@@ -19,7 +19,14 @@ from wikiparser.ontology_writer import (
     language_code_for,
     write_page_to_ontology_layout,
 )
-from wikiparser.s3_io import load_s3_config, normalize_endpoint, s3_key
+from wikiparser import s3_io
+from wikiparser.s3_io import (
+    S3UploadConfig,
+    load_s3_config,
+    normalize_endpoint,
+    s3_key,
+    upload_directory_to_s3,
+)
 
 
 SAMPLE_PAGE_XML = """<page>
@@ -144,6 +151,23 @@ def test_convert_dump_writes_chunked_json_arrays(tmp_path: Path) -> None:
     assert first_file.exists()
     assert second_file.exists()
     assert json.loads(first_file.read_text(encoding="utf-8"))[0]["page_id"] == 42
+
+
+def test_convert_dump_reports_progress_per_page(tmp_path: Path) -> None:
+    source = tmp_path / "sample.xml.bz2"
+    source.write_bytes(bz2.compress(sample_dump_xml(SAMPLE_PAGE_XML, SAMPLE_PAGE_XML).encode("utf-8")))
+
+    seen: list[str] = []
+    summary = convert_dump(
+        source=str(source),
+        output_dir=tmp_path / "out",
+        pages_per_file=1,
+        wiki_base_url="https://en.wikipedia.org/wiki/",
+        on_page=lambda page: seen.append(str(page.get("title"))),
+    )
+
+    assert summary.pages_written == 2
+    assert len(seen) == 2
 
 
 def test_extract_year_candidates_uses_title_and_infobox() -> None:
@@ -459,3 +483,31 @@ def test_s3_config_supports_parse_mongo_credential_shape(tmp_path: Path) -> None
     assert config.region_name == "ru-1"
     assert normalize_endpoint("https://s3.example.test") == "https://s3.example.test"
     assert s3_key("core/wiki", Path("pages-00001.json")) == "core/wiki/pages-00001.json"
+
+
+def test_upload_directory_reports_progress_per_file(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "out"
+    (root / "core").mkdir(parents=True)
+    (root / "a.json").write_text("{}", encoding="utf-8")
+    (root / "core" / "b.json").write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def upload_file(self, filename: str, bucket: str, key: str) -> None:
+            self.calls.append((bucket, key))
+
+    fake = FakeClient()
+    monkeypatch.setattr(s3_io, "build_s3_client", lambda config: fake)
+
+    progress: list[tuple[int, int]] = []
+    summary = upload_directory_to_s3(
+        root,
+        S3UploadConfig(bucket="bucket", prefix="core/wiki"),
+        on_file=lambda done, total, key: progress.append((done, total)),
+    )
+
+    assert summary.files_uploaded == 2
+    assert progress == [(1, 2), (2, 2)]
+    assert all(bucket == "bucket" for bucket, _ in fake.calls)

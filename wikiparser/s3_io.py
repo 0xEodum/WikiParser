@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -90,18 +91,24 @@ def s3_key(prefix: str, relative_path: Path) -> str:
     return f"{prefix.strip('/')}/{relative}".strip("/")
 
 
-def upload_directory_to_s3(local_root: str | Path, config: S3UploadConfig) -> S3UploadSummary:
+def upload_directory_to_s3(
+    local_root: str | Path,
+    config: S3UploadConfig,
+    on_file: Callable[[int, int, str], None] | None = None,
+) -> S3UploadSummary:
     root = Path(local_root)
     if not root.exists():
         raise FileNotFoundError(f"Cannot upload missing directory: {root}")
 
     client = build_s3_client(config)
+    files = [path for path in root.rglob("*") if path.is_file()]
+    total = len(files)
     uploaded = 0
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in files:
         key = s3_key(config.prefix, path.relative_to(root))
         client.upload_file(str(path), config.bucket, key)
         uploaded += 1
+        if on_file is not None:
+            on_file(uploaded, total, key)
 
     return S3UploadSummary(files_uploaded=uploaded, bucket=config.bucket, prefix=config.prefix)

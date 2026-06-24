@@ -11,7 +11,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator, Sequence
+from typing import BinaryIO, Callable, Iterator, Sequence
 from urllib.parse import quote, urljoin, urlparse
 
 import mwparserfromhell
@@ -439,6 +439,7 @@ def convert_dump(
     skip_redirects: bool = True,
     limit: int | None = None,
     output_format: str = "json",
+    on_page: Callable[[dict[str, object]], None] | None = None,
 ) -> ConversionSummary:
     if pages_per_file < 1:
         raise ValueError("pages_per_file must be >= 1")
@@ -464,6 +465,8 @@ def convert_dump(
             limit=limit,
         ):
             pages_written += 1
+            if on_page is not None:
+                on_page(page)
 
             if output_format == "ontology":
                 write_page_to_ontology_layout(page, output_path, language_code=language_code)
@@ -526,6 +529,8 @@ def convert_catalog(
     limit: int | None = None,
     archive_limit: int | None = None,
     output_format: str = "json",
+    on_page: Callable[[dict[str, object]], None] | None = None,
+    on_archive: Callable[[str, int, int], None] | None = None,
 ) -> CatalogConversionSummary:
     if archive_limit is not None and archive_limit < 1:
         raise ValueError("archive_limit must be >= 1 when provided")
@@ -543,13 +548,16 @@ def convert_catalog(
     pages_written = 0
     files_written = 0
 
-    for archive_source in selected_archives:
+    for archive_index, archive_source in enumerate(selected_archives, start=1):
         if limit is not None and pages_written >= limit:
             break
 
         remaining_limit = None if limit is None else limit - pages_written
         if remaining_limit is not None and remaining_limit < 1:
             break
+
+        if on_archive is not None:
+            on_archive(archive_source, archive_index, len(selected_archives))
 
         archive_output_dir = output_path if output_format == "ontology" else output_path / archive_output_name(archive_source)
         summary = convert_dump(
@@ -562,6 +570,7 @@ def convert_catalog(
             skip_redirects=skip_redirects,
             limit=remaining_limit,
             output_format=output_format,
+            on_page=on_page,
         )
         archive_summaries.append(
             ArchiveConversionSummary(
